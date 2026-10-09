@@ -36,6 +36,17 @@ Output in `./redteam_output/`:
 
 For defence in depth, also run it on an air-gapped machine or behind an OS firewall rule that blocks all outbound traffic except 127.0.0.1.
 
+## Choosing the model server: Ollama or oMLX
+Set `backend:` in `chatbot_profile.yaml`:
+- `backend: "ollama"` (default, also used if the line is missing) → `ollama` section, `http://localhost:11434`.
+- `backend: "omlx"` (Mac Apple Silicon) → `omlx` section, OpenAI-compatible API at `http://localhost:8000/v1`.
+  - `model` must be the id or alias exactly as listed at `http://localhost:8000/v1/models`.
+  - `structured_output: auto` sends a JSON schema (`response_format`) and switches to prompt-only JSON after the first refusal; `json_schema` / `prompt` force one method.
+  - Start it with `omlx serve --model-dir ~/models`. Don't enable the Pinggy tunnel: it exposes the server to the internet.
+  - The offline guard protects this script only. oMLX is a separate app (it has auto-update and Hugging Face downloads), so for a full guarantee cut its network access too.
+
+Both sections can stay in the file; only the one named by `backend` is used.
+
 ## Language (e.g. French chatbot)
 Set `language: "French"` in the profile. The script then:
 1. adds a language rule at the start and end of every prompt sent to Ollama (a guideline alone is ignored by small models, because DeepTeam's own prompts are in English);

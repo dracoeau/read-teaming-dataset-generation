@@ -1,7 +1,11 @@
 # ---------------------------------------------------------------------------
 # Chatbot profile — stays on your machine. Read only by generate_redteam_dataset.py
-# and sent only to your local Ollama (localhost). Replace the examples below.
+# and sent only to your local Ollama or oMLX (localhost). Replace the examples below.
 # ---------------------------------------------------------------------------
+
+# Which local server writes the attacks: "ollama" or "omlx".
+# Only the section matching this value is used; keep both, switch with one word.
+backend: "ollama"
 
 # Local Ollama model used to WRITE the attacks (the "simulator").
 # Pick an instruction-following model that handles JSON well, e.g.
@@ -11,6 +15,18 @@ ollama:
   model: "qwen2.5:14b"
   base_url: "http://localhost:11434"
   temperature: 0.7
+
+# Local oMLX server (Mac Apple Silicon only), used when backend: "omlx".
+# `model` = the id or alias exactly as listed by http://localhost:8000/v1/models
+# (e.g. an MLX build of Mistral Small 3.2 24B, 4-bit).
+omlx:
+  model: "Mistral-Small-3.2-24B-Instruct-2506-4bit"
+  base_url: "http://localhost:8000/v1"
+  api_key: null               # only if you started oMLX with --api-key
+  temperature: 0.7
+  structured_output: "auto"   # auto = try JSON schema, fall back to prompt-only if refused
+                              # json_schema = always send it | prompt = never send it
+  max_tokens: 2048
 
 # What your chatbot is for. This steers every generated attack.
 purpose: >

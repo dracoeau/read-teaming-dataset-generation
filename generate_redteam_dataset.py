@@ -3,7 +3,8 @@
 Generate an OWASP Top 10 for LLMs (2025) red-teaming dataset with DeepTeam
 (the red-teaming library built on DeepEval), 100% offline.
 
-  * The only LLM used is your local Ollama (must be on localhost).
+  * The only LLM used is your local Ollama or oMLX server (must be on localhost),
+    chosen with `backend:` in the profile.
   * A socket-level guard blocks every connection that is not to a loopback
     address, so your chatbot description and data cannot leave the machine,
     even if a library tries (telemetry, update checks, cloud upload...).
@@ -11,7 +12,7 @@ Generate an OWASP Top 10 for LLMs (2025) red-teaming dataset with DeepTeam
 
 Usage:
     python generate_redteam_dataset.py --profile chatbot_profile.yaml
-    python generate_redteam_dataset.py --profile chatbot_profile.yaml --check   # guard + Ollama test only
+    python generate_redteam_dataset.py --profile chatbot_profile.yaml --check   # guard + model server test only
 """
 
 # ---------------------------------------------------------------------------
@@ -107,6 +108,9 @@ import yaml
 from pydantic import BaseModel
 from deepeval.dataset import EvaluationDataset, Golden
 from deepeval.models import OllamaModel
+from deepeval.models import LocalModel                      # oMLX route
+from deepeval.models.llms.utils import trim_and_load_json   # oMLX route
+from openai import BadRequestError, UnprocessableEntityError  # oMLX route
 from deepteam.attacks.attack_engine import AttackEngine
 from deepteam.attacks.attack_simulator.attack_simulator import AttackSimulator
 from deepteam.attacks.multi_turn import BaseMultiTurnAttack
@@ -149,6 +153,110 @@ class LanguageEnforcedOllama(OllamaModel):
 
     def raw_generate(self, prompt, schema=None):
         return super().generate(prompt, schema)
+
+
+# ---------------------------------------------------------------------------
+# oMLX backend (Apple Silicon, OpenAI-compatible API on localhost:8000/v1)
+# ---------------------------------------------------------------------------
+# Built on deepeval's LocalModel (OpenAI-compatible client) so DeepTeam treats it
+# exactly like the Ollama model. Differences handled here:
+#   * Ollama enforces a JSON schema natively; for oMLX we send `response_format`
+#     (json_schema) AND put the schema in the prompt. If the server rejects
+#     `response_format`, we fall back to the prompt-only method automatically.
+#   * <think>...</think> blocks from reasoning models are stripped before parsing.
+
+class LanguageEnforcedOMLX(LocalModel):
+    """oMLX model reached through its OpenAI-compatible API, same language rule as Ollama."""
+
+    _wrap = LanguageEnforcedOllama._wrap  # same French/English rule as the Ollama route
+
+    def __init__(self, model, base_url="http://localhost:8000/v1", api_key=None,
+                 temperature=0.7, structured_output="auto", max_tokens=None,
+                 language=None):
+        super().__init__(model=model, api_key=api_key or "omlx-local",
+                         base_url=base_url, temperature=temperature)
+        self.language = language
+        self.max_tokens = max_tokens
+        if structured_output not in ("auto", "json_schema", "prompt"):
+            sys.exit("omlx.structured_output must be 'auto', 'json_schema' or 'prompt'.")
+        # None = not tested yet (auto); True/False = use / don't use response_format
+        self._schema_ok = None if structured_output == "auto" else structured_output == "json_schema"
+        self._sync_client = None
+        self._async_client = None
+
+    def get_model_name(self):
+        return f"{self.name} (oMLX)"
+
+    def _client(self, async_mode=False):
+        if async_mode:
+            if self._async_client is None:
+                self._async_client = self.load_model(async_mode=True)
+            return self._async_client
+        if self._sync_client is None:
+            self._sync_client = self.load_model(async_mode=False)
+        return self._sync_client
+
+    def _request(self, prompt, schema, use_schema):
+        content = prompt
+        kwargs = {"model": self.name, "temperature": self.temperature}
+        if self.max_tokens:
+            kwargs["max_tokens"] = int(self.max_tokens)
+        if schema is not None:
+            json_schema = schema.model_json_schema()
+            content = (f"{prompt}\n\nReturn ONLY one valid JSON object matching this JSON schema, "
+                       f"with no text before or after it:\n{json.dumps(json_schema, ensure_ascii=False)}")
+            if use_schema:
+                kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {"name": schema.__name__, "schema": json_schema},
+                }
+        kwargs["messages"] = [{"role": "user", "content": content}]
+        return kwargs
+
+    @staticmethod
+    def _parse(text, schema):
+        text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
+        if schema is None:
+            return text
+        return schema.model_validate(trim_and_load_json(text))
+
+    def _complete(self, prompt, schema):
+        use = schema is not None and self._schema_ok is not False
+        try:
+            res = self._client().chat.completions.create(**self._request(prompt, schema, use))
+        except (BadRequestError, UnprocessableEntityError):
+            if not use:
+                raise
+            self._schema_ok = False  # server refuses response_format: prompt-only from now on
+            res = self._client().chat.completions.create(**self._request(prompt, schema, False))
+        else:
+            if use:
+                self._schema_ok = True
+        return self._parse(res.choices[0].message.content, schema), 0.0
+
+    async def _a_complete(self, prompt, schema):
+        use = schema is not None and self._schema_ok is not False
+        client = self._client(async_mode=True)
+        try:
+            res = await client.chat.completions.create(**self._request(prompt, schema, use))
+        except (BadRequestError, UnprocessableEntityError):
+            if not use:
+                raise
+            self._schema_ok = False
+            res = await client.chat.completions.create(**self._request(prompt, schema, False))
+        else:
+            if use:
+                self._schema_ok = True
+        return self._parse(res.choices[0].message.content, schema), 0.0
+
+    def generate(self, prompt, schema=None):
+        return self._complete(self._wrap(prompt), schema)
+
+    async def a_generate(self, prompt, schema=None):
+        return await self._a_complete(self._wrap(prompt), schema)
+
+    def raw_generate(self, prompt, schema=None):
+        return self._complete(prompt, schema)
 
 
 _EN_WORDS = set("""the and is are to of you your for that this with my me please what how can
@@ -233,7 +341,7 @@ OWASP_NAMES = {
 def load_profile(path):
     with open(path, encoding="utf-8") as f:
         p = yaml.safe_load(f)
-    for key in ("ollama", "purpose"):
+    for key in ("purpose",):  # the model section ('ollama' or 'omlx') is checked by make_model
         if key not in p:
             sys.exit(f"Profile is missing '{key}'.")
     return p
@@ -248,20 +356,52 @@ def make_local_model(cfg, language=None):
                                   temperature=cfg.get("temperature", 0.7), language=language)
 
 
+def make_omlx_model(cfg, language=None):
+    base_url = cfg.get("base_url", "http://localhost:8000/v1")
+    host = urlparse(base_url).hostname
+    if not _is_loopback(host):
+        sys.exit(f"Refusing to use oMLX at {base_url}: only localhost is allowed.")
+    if "model" not in cfg:
+        sys.exit("Profile 'omlx' section is missing 'model' (the id listed by oMLX at /v1/models).")
+    return LanguageEnforcedOMLX(model=cfg["model"], base_url=base_url,
+                                api_key=cfg.get("api_key"),
+                                temperature=cfg.get("temperature", 0.7),
+                                structured_output=cfg.get("structured_output", "auto"),
+                                max_tokens=cfg.get("max_tokens"),
+                                language=language)
+
+
+def make_model(prof, language=None):
+    """Pick the route from `backend:` in the profile (default: ollama)."""
+    backend = str(prof.get("backend", "ollama")).lower()
+    if backend == "ollama":
+        if "ollama" not in prof:
+            sys.exit("backend is 'ollama' but the profile has no 'ollama' section.")
+        return make_local_model(prof["ollama"], language=language)
+    if backend == "omlx":
+        if "omlx" not in prof:
+            sys.exit("backend is 'omlx' but the profile has no 'omlx' section.")
+        return make_omlx_model(prof["omlx"], language=language)
+    sys.exit(f"Unknown backend {backend!r}: use 'ollama' or 'omlx'.")
+
+
 def self_test(model):
+    is_omlx = isinstance(model, LanguageEnforcedOMLX)
     print("• Offline guard: ", end="")
     try:
         socket.create_connection(("pypi.org", 443), timeout=3)
         sys.exit("FAILED — an external connection was possible. Stopping.")
     except NetworkBlocked:
         print("external network blocked ✓")
-    print(f"• Local Ollama ({model.get_model_name()}): ", end="", flush=True)
+    print(f"• Local {'oMLX' if is_omlx else 'Ollama'} ({model.get_model_name()}): ", end="", flush=True)
     try:
         out = model.generate("Reply with the single word: ready")
         text = out[0] if isinstance(out, tuple) else out
         print(f"responded ✓ ({str(text).strip()[:40]!r})")
     except Exception as e:
-        sys.exit(f"cannot reach it — is `ollama serve` running and the model pulled? ({e})")
+        hint = ("is `omlx serve` running and is the model id exactly as shown at /v1/models?"
+                if is_omlx else "is `ollama serve` running and the model pulled?")
+        sys.exit(f"cannot reach it — {hint} ({e})")
 
 
 def unique_attacks(attacks, include_multi_turn, keep_multilingual=True):
@@ -307,7 +447,7 @@ def main():
 
     prof = load_profile(args.profile)
     language = prof.get("language")  # e.g. "French"; None = no enforcement
-    model = make_local_model(prof["ollama"], language=language)
+    model = make_model(prof, language=language)  # ollama or omlx, from `backend:`
     self_test(model)
     if args.check:
         return
