@@ -36,6 +36,13 @@ Output in `./redteam_output/`:
 
 For defence in depth, also run it on an air-gapped machine or behind an OS firewall rule that blocks all outbound traffic except 127.0.0.1.
 
+## Language (e.g. French chatbot)
+Set `language: "French"` in the profile. The script then:
+1. adds a language rule at the start and end of every prompt sent to Ollama (a guideline alone is ignored by small models, because DeepTeam's own prompts are in English);
+2. after generation, rewrites any attack still in English. Base64 / ROT-13 / Leetspeak attacks are decoded, rewritten and re-encoded. Rewritten rows have `"rewritten_to_language": true`.
+
+`Multilingual` attacks are deliberately in another language (testing whether the bot leaks when asked in, say, Swahili). Set `keep_multilingual_attacks: false` to drop them.
+
 ## Notes
 - Quality depends on the local model. 7–8B models often break JSON; 14B+ is more reliable. Safety-tuned models may refuse to write attacks; an uncensored local variant helps.
 - Multi-turn jailbreaks (Crescendo, Tree, Linear…) need a live target to converse with, so they're off by default for a static dataset.
